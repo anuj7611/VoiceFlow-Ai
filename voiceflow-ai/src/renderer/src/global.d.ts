@@ -3,7 +3,7 @@ export {}
 declare global {
   type WritingStyle = 'natural' | 'professional' | 'concise' | 'friendly' | 'developer'
   type LanguagePreference = 'auto' | 'en-IN' | 'hi-IN'
-  type ShortcutPreset = 'ctrl-space' | 'alt-space' | 'ctrl-shift-space'
+  type ShortcutPreset = 'ctrl-space' | 'ctrl-shift-space'
 
   interface HistoryItem {
     id: string

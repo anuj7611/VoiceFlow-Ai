@@ -1,45 +1,43 @@
-appId: com.electron.app
-productName: voiceflow-ai
+appId: com.voiceflow.ai
+productName: VoiceFlow AI
+
 directories:
+  output: release
   buildResources: build
+
 files:
-  - '!**/.vscode/*'
-  - '!src/*'
-  - '!electron.vite.config.{js,ts,mjs,cjs}'
-  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
-  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
-  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - out/**/*
+  - package.json
+  - node_modules/**/*
+  - '!server/.env'
+  - '!.env'
+
+asar: true
+
 asarUnpack:
-  - resources/**
+  - '**/*.node'
+  - node_modules/uiohook-napi/**/*
+
+extraResources:
+  - from: resources/icon.png
+    to: icon.png
+
 win:
-  executableName: voiceflow-ai
-nsis:
-  artifactName: ${name}-${version}-setup.${ext}
-  shortcutName: ${productName}
-  uninstallDisplayName: ${productName}
-  createDesktopShortcut: always
-mac:
-  entitlementsInherit: build/entitlements.mac.plist
-  extendInfo:
-    - NSCameraUsageDescription: Application requests access to the device's camera.
-    - NSMicrophoneUsageDescription: Application requests access to the device's microphone.
-    - NSDocumentsFolderUsageDescription: Application requests access to the user's Documents folder.
-    - NSDownloadsFolderUsageDescription: Application requests access to the user's Downloads folder.
-  notarize: false
-dmg:
-  artifactName: ${name}-${version}.${ext}
-linux:
   target:
-    - AppImage
-    - snap
-    - deb
-  maintainer: electronjs.org
-  category: Utility
-appImage:
-  artifactName: ${name}-${version}.${ext}
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.ico
+  executableName: VoiceFlow AI
+  artifactName: VoiceFlow-AI-Setup-${version}.${ext}
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: VoiceFlow AI
+  uninstallDisplayName: VoiceFlow AI
+  deleteAppDataOnUninstall: false
+
 npmRebuild: false
-publish:
-  provider: generic
-  url: https://example.com/auto-updates
-electronDownload:
-  mirror: https://npmmirror.com/mirrors/electron/

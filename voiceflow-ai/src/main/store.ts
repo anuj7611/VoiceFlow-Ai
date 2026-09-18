@@ -6,7 +6,7 @@ import { join } from 'node:path'
 
 export type WritingStyle = 'natural' | 'professional' | 'concise' | 'friendly' | 'developer'
 export type LanguagePreference = 'auto' | 'en-IN' | 'hi-IN'
-export type ShortcutPreset = 'ctrl-space' | 'alt-space' | 'ctrl-shift-space'
+export type ShortcutPreset = 'ctrl-space' | 'ctrl-shift-space'
 
 export interface HistoryItem {
   id: string
@@ -89,7 +89,11 @@ export async function readVoiceFlowStore(): Promise<VoiceFlowStore> {
 
       settings: {
         ...defaultStore.settings,
-        ...(parsed.settings ?? {})
+        ...(parsed.settings ?? {}),
+        shortcut:
+          parsed.settings?.shortcut === 'ctrl-shift-space'
+            ? 'ctrl-shift-space'
+            : 'ctrl-space'
       }
     }
   } catch {

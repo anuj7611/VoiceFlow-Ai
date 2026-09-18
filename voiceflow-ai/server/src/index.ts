@@ -1,5 +1,4 @@
 import express from 'express'
-import dotenv from 'dotenv'
 import {
   AudioTranscriptionConfigMode,
   GoogleGenAI,
@@ -9,32 +8,37 @@ import {
 } from '@google/genai'
 
 import { createServer } from 'node:http'
-import { join } from 'node:path'
 import { WebSocket, WebSocketServer } from 'ws'
-
-dotenv.config({
-  path: join(process.cwd(), 'server', '.env')
-})
 
 const PORT = Number(process.env.PORT) || 4000
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash'
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash'
 const LIVE_TRANSCRIBE_MODEL =
   process.env.LIVE_TRANSCRIBE_MODEL || 'gemini-3.5-transcribe-live'
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY
-
-if (!GEMINI_API_KEY) {
-  throw new Error('GEMINI_API_KEY is missing in server/.env')
-}
 
 /* =====================================================
    GEMINI CLIENT
 ===================================================== */
 
-const ai = new GoogleGenAI({
-  apiKey: GEMINI_API_KEY
-})
+let ai: GoogleGenAI | null = null
+
+function getGeminiClient(): GoogleGenAI {
+  if (ai) {
+    return ai
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY
+
+  if (!apiKey) {
+    throw new Error(
+      'GEMINI_API_KEY is missing. Configure it outside the packaged application.'
+    )
+  }
+
+  ai = new GoogleGenAI({ apiKey })
+
+  return ai
+}
 
 /* =====================================================
    EXPRESS
@@ -430,12 +434,12 @@ Redux Toolkit
          GEMINI AUDIO REQUEST
       ------------------------------------------ */
 
-      const response = await ai.models.generateContent({
+      const response = await getGeminiClient().models.generateContent({
         model: GEMINI_MODEL,
 
         config: {
           thinkingConfig: {
-            thinkingLevel: ThinkingLevel.MINIMAL
+            thinkingLevel: ThinkingLevel.LOW
           }
         },
 
@@ -593,11 +597,11 @@ ${text.trim()}
 TRANSCRIPT_END
     `.trim()
 
-    const response = await ai.models.generateContent({
+    const response = await getGeminiClient().models.generateContent({
       model: GEMINI_MODEL,
       config: {
         thinkingConfig: {
-          thinkingLevel: ThinkingLevel.MINIMAL
+          thinkingLevel: ThinkingLevel.LOW
         }
       },
       contents: [{ text: prompt }]
@@ -695,7 +699,7 @@ wss.on('connection', (socket) => {
         console.log(`📖 Vocabulary: ${dictionary.length} words`)
         console.log('🌐 Language:', requestedLanguage)
 
-        geminiSession = await ai.live.connect({
+        geminiSession = await getGeminiClient().live.connect({
           model: LIVE_TRANSCRIBE_MODEL,
           config: {
             responseModalities: [Modality.TEXT],
@@ -784,7 +788,17 @@ wss.on('connection', (socket) => {
    START API
 ===================================================== */
 
-httpServer.listen(PORT, '127.0.0.1', () => {
-  console.log(`🚀 VoiceFlow API: http://127.0.0.1:${PORT}`)
-  console.log(`🎙 Live STT: ${LIVE_TRANSCRIBE_MODEL}`)
-})
+let serverStarted = false
+
+export function startVoiceFlowServer(): void {
+  if (serverStarted) {
+    return
+  }
+
+  serverStarted = true
+
+  httpServer.listen(PORT, '127.0.0.1', () => {
+    console.log(`🚀 VoiceFlow internal API running on http://127.0.0.1:${PORT}`)
+    console.log(`🎙 Live model: ${LIVE_TRANSCRIBE_MODEL}`)
+  })
+}

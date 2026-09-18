@@ -7,8 +7,6 @@ type VoiceStatus = 'idle' | 'listening' | 'processing' | 'done' | 'error'
 
 function getShortcutLabel(shortcut: ShortcutPreset): string {
   switch (shortcut) {
-    case 'alt-space':
-      return 'Alt + Space'
     case 'ctrl-shift-space':
       return 'Ctrl + Shift + Space'
     default:
@@ -372,7 +370,6 @@ function MainApp(): JSX.Element {
                   }
                 >
                   <option value="ctrl-space">Ctrl + Space</option>
-                  <option value="alt-space">Alt + Space</option>
                   <option value="ctrl-shift-space">Ctrl + Shift + Space</option>
                 </select>
                 <div className="keyboard-help">Press Esc during dictation to cancel.</div>
@@ -454,6 +451,7 @@ function VoiceOverlay(): JSX.Element {
   const websocketRef = useRef<WebSocket | null>(null)
   const liveReadyRef = useRef(false)
   const pendingPCMRef = useRef<ArrayBuffer[]>([])
+  const latestTranscriptRef = useRef('')
   const finalTranscriptRef = useRef('')
   const finalResolveRef = useRef<((text: string) => void) | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
@@ -515,7 +513,7 @@ function VoiceOverlay(): JSX.Element {
     }
   }
 
-  function waitForFinalTranscript(timeout = 3500): Promise<string> {
+  function waitForFinalTranscript(timeout = 350): Promise<string> {
     if (finalTranscriptRef.current) {
       return Promise.resolve(finalTranscriptRef.current)
     }
@@ -536,7 +534,7 @@ function VoiceOverlay(): JSX.Element {
       finalResolveRef.current = finish
 
       setTimeout(() => {
-        finish(finalTranscriptRef.current)
+        finish(finalTranscriptRef.current || latestTranscriptRef.current)
       }, timeout)
     })
   }
@@ -590,6 +588,7 @@ function VoiceOverlay(): JSX.Element {
       setLiveTranscript('')
 
       cancelledRef.current = false
+      latestTranscriptRef.current = ''
       finalTranscriptRef.current = ''
       finalResolveRef.current = null
       pendingPCMRef.current = []
@@ -647,13 +646,17 @@ function VoiceOverlay(): JSX.Element {
           }
 
           if (message.type === 'interim' && message.text) {
-            setLiveTranscript(message.text)
+            const text = message.text.trim()
+
+            latestTranscriptRef.current = text
+            setLiveTranscript(text)
             return
           }
 
           if (message.type === 'final' && message.text) {
             const text = message.text.trim()
 
+            latestTranscriptRef.current = text
             finalTranscriptRef.current = text
             setLiveTranscript(text)
             finalResolveRef.current?.(text)
@@ -712,6 +715,10 @@ function VoiceOverlay(): JSX.Element {
 
   async function stopRecording(): Promise<void> {
     try {
+      if (cancelledRef.current) {
+        return
+      }
+
       setStatus('processing')
 
       workletNodeRef.current?.disconnect()
@@ -730,13 +737,21 @@ function VoiceOverlay(): JSX.Element {
         socket.send(JSON.stringify({ type: 'stop' }))
       }
 
-      const liveText = await waitForFinalTranscript(3500)
+      const liveText = liveReadyRef.current ? await waitForFinalTranscript(350) : ''
       const fallbackAudio = await fallbackAudioPromise
+
+      if (cancelledRef.current) {
+        return
+      }
 
       if (liveText.trim()) {
         console.log('📝 LIVE TRANSCRIPT:', liveText)
 
         const result = await window.voiceAPI.finalizeLiveTranscript(liveText)
+
+        if (cancelledRef.current) {
+          return
+        }
 
         console.log('✨ FINAL:', result.cleanedText)
         setLiveTranscript(result.cleanedText)
@@ -746,6 +761,10 @@ function VoiceOverlay(): JSX.Element {
 
         const result = await window.voiceAPI.processRecording(fallbackAudio)
 
+        if (cancelledRef.current) {
+          return
+        }
+
         setLiveTranscript(result.cleanedText)
         setStatus('done')
       } else {
@@ -753,7 +772,10 @@ function VoiceOverlay(): JSX.Element {
       }
     } catch (error) {
       console.error('Dictation processing failed:', error)
-      setStatus('error')
+
+      if (!cancelledRef.current) {
+        setStatus('error')
+      }
     } finally {
       streamRef.current?.getTracks().forEach((track) => {
         track.stop()
@@ -776,6 +798,11 @@ function VoiceOverlay(): JSX.Element {
     console.log('❌ Cancelling dictation...')
 
     cancelledRef.current = true
+
+    const resolveFinalTranscript = finalResolveRef.current
+    finalResolveRef.current = null
+    resolveFinalTranscript?.('')
+
     playTone(260, 100)
     setLiveTranscript('')
     setStatus('idle')
@@ -804,8 +831,8 @@ function VoiceOverlay(): JSX.Element {
       streamRef.current = null
       chunksRef.current = []
       pendingPCMRef.current = []
+      latestTranscriptRef.current = ''
       finalTranscriptRef.current = ''
-      finalResolveRef.current = null
       liveReadyRef.current = false
     } catch (error) {
       console.error('Cancel cleanup:', error)

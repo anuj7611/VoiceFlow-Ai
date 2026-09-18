@@ -1,4 +1,15 @@
-import { app, BrowserWindow, clipboard, ipcMain, Menu, screen, session, Tray } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  globalShortcut,
+  ipcMain,
+  Menu,
+  screen,
+  session,
+  Tray
+} from 'electron'
+import dotenv from 'dotenv'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
@@ -12,12 +23,20 @@ import {
   type WritingStyle
 } from './store'
 import { uIOhook, UiohookKey, type UiohookKeyboardEvent } from 'uiohook-napi'
+// The server entry is outside the TypeScript project files list; ignore type-checking here
+// @ts-ignore: Imported module is not listed in tsconfig file list
+import { startVoiceFlowServer } from '../../server/src/index'
+
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.voiceflow.ai')
+}
 
 const API_URL = 'http://127.0.0.1:4000'
-
+   
 type ActiveAppContext = {
   processName: string
   title: string
+  windowHandle: string
   mode: 'developer' | 'email' | 'chat' | 'writing' | 'browser' | 'general'
 }
 
@@ -27,12 +46,16 @@ let tray: Tray | null = null
 
 let isQuitting = false
 let isPushToTalkActive = false
+let isInjectingText = false
 let currentShortcut: ShortcutPreset = 'ctrl-space'
+let registeredPushToTalkAccelerator: string | null = null
+let isPushToTalkShortcutRegistered = false
 let activeDictationId = 0
 const cancelledDictationIds = new Set<number>()
 let activeAppContext: ActiveAppContext = {
   processName: 'unknown',
   title: '',
+  windowHandle: '0',
   mode: 'general'
 }
 
@@ -184,11 +207,93 @@ function positionOverlay(): void {
   overlayWindow.setPosition(positionX, positionY, false)
 }
 
+function unregisterEscapeShortcut(): void {
+  if (globalShortcut.isRegistered('Escape')) {
+    globalShortcut.unregister('Escape')
+  }
+}
+
+function hideOverlay(): void {
+  unregisterEscapeShortcut()
+  overlayWindow?.hide()
+}
+
+function registerEscapeShortcut(): void {
+  unregisterEscapeShortcut()
+
+  const registered = globalShortcut.register('Escape', () => {
+    if (overlayWindow?.isVisible()) {
+      cancelPushToTalk()
+    }
+  })
+
+  if (!registered) {
+    console.error('Unable to register Escape shortcut')
+  }
+}
+
+function getPushToTalkAccelerator(shortcut: ShortcutPreset): string {
+  switch (shortcut) {
+    case 'ctrl-shift-space':
+      return 'CommandOrControl+Shift+Space'
+
+    case 'ctrl-space':
+    default:
+      return 'CommandOrControl+Space'
+  }
+}
+
+function registerPushToTalkShortcut(): void {
+  if (registeredPushToTalkAccelerator) {
+    globalShortcut.unregister(registeredPushToTalkAccelerator)
+  }
+
+  const accelerator = getPushToTalkAccelerator(currentShortcut)
+
+  isPushToTalkShortcutRegistered = globalShortcut.register(accelerator, () => {
+    startPushToTalk()
+  })
+
+  registeredPushToTalkAccelerator = isPushToTalkShortcutRegistered ? accelerator : null
+
+  if (isPushToTalkShortcutRegistered) {
+    console.log(`✅ Push-to-talk shortcut registered: ${accelerator}`)
+  } else {
+    console.error(`❌ Unable to register push-to-talk shortcut: ${accelerator}`)
+  }
+}
+
 /* ======================================================
    WINDOWS AUTO PASTE
 ====================================================== */
 
-async function pasteIntoActiveApp(text: string): Promise<void> {
+async function pasteIntoFocusedApp(text: string): Promise<void> {
+  if (!text.trim()) {
+    return
+  }
+
+  clipboard.writeText(text)
+  unregisterEscapeShortcut()
+
+  await new Promise((resolve) => setTimeout(resolve, 40))
+
+  isInjectingText = true
+
+  try {
+    // The overlay never takes focus, so paste directly into the application
+    // the user is already using. This does not alter its window state.
+    uIOhook.keyTap(UiohookKey.V, [UiohookKey.Ctrl])
+
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  } catch (error) {
+    console.error('Direct paste failed, using focused-control fallback:', error)
+    await pasteIntoActiveApp(text, activeAppContext.windowHandle)
+  } finally {
+    isInjectingText = false
+  }
+}
+
+async function pasteIntoActiveApp(text: string, windowHandle: string): Promise<void> {
   if (!text.trim()) {
     return
   }
@@ -202,13 +307,180 @@ async function pasteIntoActiveApp(text: string): Promise<void> {
 
   clipboard.writeText(text)
 
+  // Alt+Space opens the Windows system menu in apps such as Notepad.
+  // Stop consuming Escape before using it to dismiss that menu.
+  unregisterEscapeShortcut()
+
   await new Promise((resolve) => setTimeout(resolve, 100))
 
   return new Promise<void>((resolve, reject) => {
+    const safeWindowHandle = /^\d+$/.test(windowHandle) ? windowHandle : '0'
     const command = `
-Add-Type -AssemblyName System.Windows.Forms;
-[System.Windows.Forms.SendKeys]::SendWait('^v');
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+public class VoiceFlowPasteTarget {
+    private const byte VK_CONTROL = 0x11;
+    private const byte VK_MENU = 0x12;
+    private const byte VK_V = 0x56;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GUITHREADINFO {
+        public uint cbSize;
+        public uint flags;
+        public IntPtr hwndActive;
+        public IntPtr hwndFocus;
+        public IntPtr hwndCapture;
+        public IntPtr hwndMenuOwner;
+        public IntPtr hwndMoveSize;
+        public IntPtr hwndCaret;
+        public RECT rcCaret;
+    }
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO info);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetFocus(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
+
+    private static IntPtr FindEditControl(IntPtr parent) {
+        IntPtr result = IntPtr.Zero;
+
+        EnumChildWindows(parent, delegate(IntPtr child, IntPtr _) {
+            StringBuilder className = new StringBuilder(256);
+            GetClassName(child, className, className.Capacity);
+            string value = className.ToString();
+
+            if (value.IndexOf("edit", StringComparison.OrdinalIgnoreCase) >= 0) {
+                result = child;
+                return false;
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        return result;
+    }
+
+    private static void KeyDown(byte key) {
+        keybd_event(key, 0, 0, UIntPtr.Zero);
+    }
+
+    private static void KeyUp(byte key) {
+        keybd_event(key, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+    }
+
+    private static void Tap(byte key) {
+        KeyDown(key);
+        KeyUp(key);
+    }
+
+    public static bool Paste(IntPtr target) {
+        if (target == IntPtr.Zero) {
+            return false;
+        }
+
+        uint ignoredProcessId;
+        uint currentThread = GetCurrentThreadId();
+        uint targetThread = GetWindowThreadProcessId(target, out ignoredProcessId);
+        IntPtr previousForeground = GetForegroundWindow();
+        uint foregroundThread = GetWindowThreadProcessId(previousForeground, out ignoredProcessId);
+        bool attachedToTarget = false;
+        bool attachedToForeground = false;
+
+        try {
+            if (targetThread != 0 && targetThread != currentThread) {
+                attachedToTarget = AttachThreadInput(currentThread, targetThread, true);
+            }
+
+            if (foregroundThread != 0 && foregroundThread != currentThread && foregroundThread != targetThread) {
+                attachedToForeground = AttachThreadInput(currentThread, foregroundThread, true);
+            }
+
+            Thread.Sleep(120);
+
+            GUITHREADINFO info = new GUITHREADINFO();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+            GetGUIThreadInfo(targetThread, ref info);
+
+            IntPtr editControl = FindEditControl(target);
+            IntPtr focusTarget = editControl != IntPtr.Zero
+                ? editControl
+                : (info.hwndFocus != IntPtr.Zero ? info.hwndFocus : info.hwndCaret);
+
+            if (focusTarget != IntPtr.Zero) {
+                SetFocus(focusTarget);
+            }
+
+            // Clear modifiers that may still be logically held by Alt+Space.
+            KeyUp(VK_MENU);
+            KeyUp(VK_CONTROL);
+
+            KeyDown(VK_CONTROL);
+            Tap(VK_V);
+            KeyUp(VK_CONTROL);
+
+            Thread.Sleep(80);
+
+            return GetForegroundWindow() == target;
+        }
+        finally {
+            if (attachedToForeground) {
+                AttachThreadInput(currentThread, foregroundThread, false);
+            }
+
+            if (attachedToTarget) {
+                AttachThreadInput(currentThread, targetThread, false);
+            }
+        }
+    }
+}
+"@;
+
+$target = [IntPtr]::new([Int64]::Parse('${safeWindowHandle}'));
+$inserted = [VoiceFlowPasteTarget]::Paste($target);
+
+if (-not $inserted) {
+    throw 'Could not activate the target application for text insertion.';
+}
     `.trim()
+
+    isInjectingText = true
 
     execFile(
       'powershell.exe',
@@ -220,6 +492,8 @@ Add-Type -AssemblyName System.Windows.Forms;
       },
 
       (error) => {
+        isInjectingText = false
+
         if (error) {
           reject(error)
 
@@ -288,9 +562,7 @@ function setupIPC(): void {
       return store
     }
 
-    const exists = store.dictionary.some(
-      (item) => item.toLowerCase() === cleanWord.toLowerCase()
-    )
+    const exists = store.dictionary.some((item) => item.toLowerCase() === cleanWord.toLowerCase())
 
     if (!exists) {
       store.dictionary.push(cleanWord)
@@ -315,28 +587,25 @@ function setupIPC(): void {
      SNIPPETS
   ===================================================== */
 
-  ipcMain.handle(
-    'snippets:add',
-    async (_event, data: { trigger: string; expansion: string }) => {
-      const store = await readVoiceFlowStore()
-      const trigger = data.trigger.trim()
-      const expansion = data.expansion.trim()
+  ipcMain.handle('snippets:add', async (_event, data: { trigger: string; expansion: string }) => {
+    const store = await readVoiceFlowStore()
+    const trigger = data.trigger.trim()
+    const expansion = data.expansion.trim()
 
-      if (!trigger || !expansion) {
-        return store
-      }
-
-      store.snippets.unshift({
-        id: randomUUID(),
-        trigger,
-        expansion
-      })
-
-      await writeVoiceFlowStore(store)
-
+    if (!trigger || !expansion) {
       return store
     }
-  )
+
+    store.snippets.unshift({
+      id: randomUUID(),
+      trigger,
+      expansion
+    })
+
+    await writeVoiceFlowStore(store)
+
+    return store
+  })
 
   ipcMain.handle('snippets:remove', async (_event, id: string) => {
     const store = await readVoiceFlowStore()
@@ -352,45 +621,40 @@ function setupIPC(): void {
      WRITING STYLE
   ===================================================== */
 
-  ipcMain.handle(
-    'settings:update',
-    async (_event, patch: Partial<VoiceFlowSettings>) => {
-      const store = await readVoiceFlowStore()
+  ipcMain.handle('settings:update', async (_event, patch: Partial<VoiceFlowSettings>) => {
+    const store = await readVoiceFlowStore()
 
-      if (patch.writingStyle) {
-        store.settings.writingStyle = patch.writingStyle
-      }
-
-      if (typeof patch.microphoneId === 'string') {
-        store.settings.microphoneId = patch.microphoneId
-      }
-
-      if (patch.language && ['auto', 'en-IN', 'hi-IN'].includes(patch.language)) {
-        store.settings.language = patch.language
-      }
-
-      if (
-        patch.shortcut &&
-        ['ctrl-space', 'alt-space', 'ctrl-shift-space'].includes(patch.shortcut)
-      ) {
-        store.settings.shortcut = patch.shortcut
-        currentShortcut = patch.shortcut
-      }
-
-      if (typeof patch.soundFeedback === 'boolean') {
-        store.settings.soundFeedback = patch.soundFeedback
-      }
-
-      if (typeof patch.launchAtStartup === 'boolean') {
-        store.settings.launchAtStartup = patch.launchAtStartup
-        applyLaunchAtStartup(patch.launchAtStartup)
-      }
-
-      await writeVoiceFlowStore(store)
-
-      return store
+    if (patch.writingStyle) {
+      store.settings.writingStyle = patch.writingStyle
     }
-  )
+
+    if (typeof patch.microphoneId === 'string') {
+      store.settings.microphoneId = patch.microphoneId
+    }
+
+    if (patch.language && ['auto', 'en-IN', 'hi-IN'].includes(patch.language)) {
+      store.settings.language = patch.language
+    }
+
+    if (patch.shortcut && ['ctrl-space', 'ctrl-shift-space'].includes(patch.shortcut)) {
+      store.settings.shortcut = patch.shortcut
+      currentShortcut = patch.shortcut
+      registerPushToTalkShortcut()
+    }
+
+    if (typeof patch.soundFeedback === 'boolean') {
+      store.settings.soundFeedback = patch.soundFeedback
+    }
+
+    if (typeof patch.launchAtStartup === 'boolean') {
+      store.settings.launchAtStartup = patch.launchAtStartup
+      applyLaunchAtStartup(patch.launchAtStartup)
+    }
+
+    await writeVoiceFlowStore(store)
+
+    return store
+  })
 
   ipcMain.handle('settings:set-writing-style', async (_event, style: WritingStyle) => {
     const store = await readVoiceFlowStore()
@@ -428,43 +692,18 @@ function setupIPC(): void {
 
       const store = await readVoiceFlowStore()
 
-      console.log('\n✨ Finalizing live transcript...')
+      console.log('\n⚡ Using fast live transcript...')
       console.log('RAW:', rawText)
-
-      const response = await fetch(`${API_URL}/api/finalize-text`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          text: rawText,
-          processName: activeAppContext.processName,
-          windowTitle: activeAppContext.title,
-          mode: activeAppContext.mode,
-          writingStyle: store.settings.writingStyle,
-          dictionary: store.dictionary.slice(0, 100)
-        })
-      })
-
-      const result = (await response.json()) as {
-        success: boolean
-        cleanedText?: string
-        message?: string
-      }
-
-      if (!response.ok || !result.success || !result.cleanedText) {
-        throw new Error(result.message || 'Final cleanup failed')
-      }
 
       if (cancelledDictationIds.has(dictationId)) {
         throw new Error('Dictation cancelled')
       }
 
-      const finalText = applySnippet(result.cleanedText, store.snippets)
+      const finalText = applySnippet(rawText, store.snippets)
 
       console.log('FINAL:', finalText)
 
-      await pasteIntoActiveApp(finalText)
+      await pasteIntoFocusedApp(finalText)
 
       if (cancelledDictationIds.has(dictationId)) {
         throw new Error('Dictation cancelled')
@@ -488,8 +727,8 @@ function setupIPC(): void {
       mainWindow?.webContents.send('history:updated', historyItem)
 
       setTimeout(() => {
-        overlayWindow?.hide()
-      }, 500)
+        hideOverlay()
+      }, 150)
 
       return {
         rawText,
@@ -499,7 +738,7 @@ function setupIPC(): void {
       console.error('❌ Finalize live failed:', error)
 
       setTimeout(() => {
-        overlayWindow?.hide()
+        hideOverlay()
       }, 2000)
 
       throw error
@@ -567,7 +806,7 @@ function setupIPC(): void {
 
         const finalText = applySnippet(result.cleanedText, store.snippets)
 
-        await pasteIntoActiveApp(finalText)
+        await pasteIntoFocusedApp(finalText)
 
         if (cancelledDictationIds.has(dictationId)) {
           throw new Error('Dictation cancelled')
@@ -597,8 +836,8 @@ function setupIPC(): void {
         console.log('⌨ Text inserted')
 
         setTimeout(() => {
-          overlayWindow?.hide()
-        }, 450)
+          hideOverlay()
+        }, 150)
 
         return {
           rawText: result.rawText || '',
@@ -630,7 +869,7 @@ function setupIPC(): void {
         overlayWindow?.webContents.send('voice:error', details?.message || 'AI processing failed')
 
         setTimeout(() => {
-          overlayWindow?.hide()
+          hideOverlay()
         }, 3000)
 
         throw error
@@ -724,6 +963,7 @@ $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
 $result = [PSCustomObject]@{
     processName = $process.ProcessName
     title = $process.MainWindowTitle
+    windowHandle = $handle.ToInt64().ToString()
 }
 
 $result | ConvertTo-Json -Compress
@@ -736,7 +976,7 @@ $result | ConvertTo-Json -Compress
       (error, stdout) => {
         if (error) {
           console.error('Active app detection failed:', error)
-          resolve({ processName: 'unknown', title: '', mode: 'general' })
+          resolve({ processName: 'unknown', title: '', windowHandle: '0', mode: 'general' })
           return
         }
 
@@ -744,18 +984,21 @@ $result | ConvertTo-Json -Compress
           const parsed = JSON.parse(stdout.trim()) as {
             processName?: string
             title?: string
+            windowHandle?: string
           }
           const processName = parsed.processName || 'unknown'
           const title = parsed.title || ''
+          const windowHandle = parsed.windowHandle || '0'
 
           resolve({
             processName,
             title,
+            windowHandle,
             mode: determineAppMode(processName, title)
           })
         } catch (error) {
           console.error('Active app parsing failed:', error)
-          resolve({ processName: 'unknown', title: '', mode: 'general' })
+          resolve({ processName: 'unknown', title: '', windowHandle: '0', mode: 'general' })
         }
       }
     )
@@ -772,9 +1015,6 @@ function matchesPushToTalkShortcut(event: UiohookKeyboardEvent): boolean {
   }
 
   switch (currentShortcut) {
-    case 'alt-space':
-      return event.altKey && !event.ctrlKey && !event.shiftKey
-
     case 'ctrl-shift-space':
       return event.ctrlKey && event.shiftKey && !event.altKey
 
@@ -800,12 +1040,15 @@ function startPushToTalk(): void {
     console.log('🪟 Active application:')
     console.log(`Process: ${context.processName}`)
     console.log(`Title: ${context.title}`)
+    console.log(`Window handle: ${context.windowHandle}`)
     console.log(`Mode: ${context.mode}`)
 
     overlayWindow?.webContents.send('voice:context', context)
   })
 
   positionOverlay()
+
+  registerEscapeShortcut()
 
   overlayWindow?.showInactive()
 
@@ -831,7 +1074,7 @@ function stopPushToTalk(): void {
    * DO NOT hide here.
    * Overlay remains visible
    * while AI processes speech.
-  */
+   */
 }
 
 function cancelPushToTalk(): void {
@@ -842,7 +1085,7 @@ function cancelPushToTalk(): void {
   console.log('❌ Dictation cancelled')
 
   overlayWindow?.webContents.send('voice:cancel')
-  overlayWindow?.hide()
+  hideOverlay()
 
   setTimeout(() => {
     cancelledDictationIds.delete(dictationId)
@@ -856,6 +1099,7 @@ function cancelPushToTalk(): void {
 function setupKeyboardHook(): void {
   uIOhook.on('keydown', (event) => {
     if (
+      !isInjectingText &&
       event.keycode === UiohookKey.Escape &&
       (isPushToTalkActive || overlayWindow?.isVisible())
     ) {
@@ -863,7 +1107,11 @@ function setupKeyboardHook(): void {
       return
     }
 
-    if (matchesPushToTalkShortcut(event) && !isPushToTalkActive) {
+    if (
+      !isPushToTalkShortcutRegistered &&
+      matchesPushToTalkShortcut(event) &&
+      !isPushToTalkActive
+    ) {
       startPushToTalk()
     }
   })
@@ -884,7 +1132,7 @@ function setupKeyboardHook(): void {
 ====================================================== */
 
 function createTray(): void {
-  tray = new Tray(join(__dirname, '../../resources/icon.png'))
+  tray = new Tray(getTrayIconPath())
 
   const menu = Menu.buildFromTemplate([
     {
@@ -919,34 +1167,69 @@ function createTray(): void {
   })
 }
 
+function getTrayIconPath(): string {
+  if (app.isPackaged) {
+    return join(process.resourcesPath, 'icon.png')
+  }
+
+  return join(process.cwd(), 'resources', 'icon.png')
+}
+
 /* ======================================================
    APP START
 ====================================================== */
 
-app.whenReady().then(async () => {
-  const store = await readVoiceFlowStore()
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
-  currentShortcut = store.settings.shortcut
-  applyLaunchAtStartup(store.settings.launchAtStartup)
+if (!hasSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow?.isMinimized()) {
+      mainWindow.restore()
+    }
 
-  setupPermissions()
+    mainWindow?.show()
+    mainWindow?.focus()
+  })
 
-  setupIPC()
+  app.whenReady().then(async () => {
+    if (app.isPackaged) {
+      dotenv.config({
+        path: join(app.getPath('userData'), '.env')
+      })
 
-  createMainWindow()
+      startVoiceFlowServer()
+    }
 
-  createOverlayWindow()
+    const store = await readVoiceFlowStore()
 
-  createTray()
+    currentShortcut = store.settings.shortcut
+    applyLaunchAtStartup(store.settings.launchAtStartup)
 
-  setupKeyboardHook()
-})
+    setupPermissions()
+
+    setupIPC()
+
+    createMainWindow()
+
+    createOverlayWindow()
+
+    createTray()
+
+    registerPushToTalkShortcut()
+
+    setupKeyboardHook()
+  })
+}
 
 /* ======================================================
    APP CLEANUP
 ====================================================== */
 
 app.on('will-quit', () => {
+  globalShortcut.unregisterAll()
+
   try {
     uIOhook.stop()
   } catch (error) {
